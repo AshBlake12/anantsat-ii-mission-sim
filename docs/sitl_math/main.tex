@@ -1,0 +1,645 @@
+%=====================================================================
+%  AnantSAT-II 3U SITL Simulator (cubesat_sim)
+%  Mathematical Model Reference and Verification Notes
+%  Team Anant, BITS Pilani
+%
+%  Compile with pdflatex (Overleaf default). Standard packages only.
+%  To use the team class instead, replace \documentclass{article} with
+%  \documentclass{AnantDocumentation} and drop the geometry package.
+%=====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.2cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\vb}[1]{\boldsymbol{#1}}
+\newcommand{\uv}[1]{\hat{\boldsymbol{#1}}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\src}[1]{\textcolor{gray}{\small[\texttt{#1}]}}
+\newcommand{\tp}{^{\mathsf{T}}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{Team Anant, BITS Pilani}
+\rhead{AnantSAT-II SITL: Mathematical Model Reference}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\setlength{\headheight}{14pt}
+
+\begin{document}
+
+%---------------------- Title page -----------------------------------
+\begin{titlepage}
+\centering
+\vspace*{3cm}
+{\Huge \textbf{AnantSAT-II}}\\[0.4cm]
+{\Large 3U Hyperspectral CubeSat}\\[1.5cm]
+{\LARGE \textbf{SITL Mission Simulator (\texttt{cubesat\_sim})}}\\[0.3cm]
+{\Large Mathematical Model Reference and Verification Notes}\\[0.5cm]
+{\Large October 2026}\\[2.5cm]
+\begin{tabular}{ll}
+\textbf{Audience} & ADCS lead, systems engineering \\[0.3cm]
+\textbf{Covers} & \texttt{src/*.hpp}, \texttt{src/sim.cpp}, \texttt{config/sim.cfg} \\[0.3cm]
+\textbf{Document version} & 01 (draft) \\
+\end{tabular}
+\vfill
+{\large Team Anant\\ Birla Institute of Technology and Science, Pilani\\ Pilani Campus}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+%=====================================================================
+\section{Purpose and Summary of Findings}
+%=====================================================================
+
+This document writes down every equation the simulator uses, in the order the code applies them, with the source file next to each one. It was written because the team suspected the mathematics might be wrong. Each equation was checked against its reference (Vallado 4th ed., Montenbruck \& Gill, the IGRF-14 specification, and Avanzini \& Giulietti 2012 for B-dot). Each also has a source tag \src{file.hpp:line} so the ADCS lead can open the matching code.
+
+\subsection*{Verdict}
+
+\textbf{No equation in the code is wrong.} The frames, signs, units and recursions were checked by hand, and the 55 automated tests in \code{tests/tests.cpp} pass (Section~\ref{sec:verif}). The real problems are about \emph{what the simulator models}, not the algebra:
+
+\begin{enumerate}
+\item \textbf{Mission-mode attitude is kinematic, not closed-loop} (Section~\ref{sec:mission}). After detumbling, the spacecraft follows a rate- and acceleration-limited reference attitude exactly. No sensor, estimator or feedback controller is modelled, and the wheels are assumed to absorb whatever momentum the motion needs. As a result the simulator \emph{cannot} predict pointing accuracy or jitter, and it cannot be used to tune controller gains. This is the most likely reason the ADCS results ``look wrong''.
+\item \textbf{The wheel momentum margin is thin.} Peak CW0017 momentum reaches 1.605\,mNms, which is 91\,\% of the 1.77\,mNms rating, in both the 48\,h mission run and the 12\,h launch run. The automatic slew rate spends 80\,\% of the rating on body motion alone (Section~\ref{sec:slew}).
+\item \textbf{A configuration value is silently ignored.} \code{orbit.mass\_kg = 4.0} is not used when \code{[mass\_budget]} is present. The simulator flies the mass-budget total of 2.716\,kg instead, which changes the drag ballistic coefficient by 47\,\% (Section~\ref{sec:drag}).
+\end{enumerate}
+
+Table~\ref{tab:findings} lists all findings. Section~\ref{sec:verif} gives the checks behind the verdict.
+
+\begin{longtable}{@{}L{1.3cm}L{1.6cm}L{8.2cm}L{4.4cm}@{}}
+\caption{Findings, most important first.}\label{tab:findings}\\
+\toprule
+\textbf{ID} & \textbf{Severity} & \textbf{Finding} & \textbf{Recommendation}\\
+\midrule
+\endfirsthead
+\toprule
+\textbf{ID} & \textbf{Severity} & \textbf{Finding} & \textbf{Recommendation}\\
+\midrule
+\endhead
+ADCS-1 & High (scope) & Mission-mode attitude follows a kinematic reference with no sensors, estimator, control law or actuator torque limit. Pointing error is only the lag of the reference profile. & Replace with the dynamic plant of Eq.~\eqref{eq:plant} and a quaternion PD law (Section~\ref{sec:recommend}).\\
+ADCS-2 & Medium & Peak wheel momentum is 91\,\% of the CW0017 rating. $\omega_{\max}$ uses 80\,\% of $h_{\text{rated}}$ for body momentum and ignores momentum already stored in the wheels. Saturation is only flagged; the simulation carries on as if control were kept. & Size $\omega_{\max}$ from the remaining capacity (Eq.~\eqref{eq:wmax-fix}), enforce saturation, or study CW0057.\\
+CFG-1 & Medium & \code{orbit.mass\_kg = 4.0} is ignored when \code{[mass\_budget]} exists. Drag uses $m = 2.716$\,kg. & Decide which mass is correct. Remove the unused key or make the mass budget add up.\\
+ADCS-3 & Low & The B-dot law uses $\dot{\vb B}/\lVert\vb B\rVert^2$, while the reference uses $\dot{\uv b}/\lVert\vb B\rVert$. The torque is \emph{identical} (proof in Section~\ref{sec:bdot}); only the saturation scaling differs slightly. & No change needed. Optionally remove the component of $\dot{\vb B}$ along $\uv b$ before saturating.\\
+ADCS-4 & Low & The magnetometer is ideal: no noise, bias, quantisation or torquer cross-talk. The duty cycle only reduces the available dipole. & Add sensor models when testing flight code.\\
+ADCS-5 & Low & The feed-forward rate $\vb\omega_{\text{ff}}$ is a finite difference of the guidance quaternion and is not clamped. A secondary-axis fallback in the guidance law can make it spike. & Clamp $\lVert\vb\omega_{\text{ff}}\rVert$ to $\omega_{\max}$.\\
+ADCS-6 & Info & In downlink mode the configured secondary axis (Sun axis $+Z$) is antiparallel to the antenna axis ($-Z$). The code therefore falls back to $+X$ pointing at the Sun. & Confirm this is the intended downlink attitude.\\
+ENV-1 & Low & The atmosphere is a static exponential (CIRA-72). In 2027, density at 500\,km can be 2--5$\times$ higher; aerodynamic torque and drag scale linearly with it. & Run sensitivity cases with \code{density\_scale} = 2 and 5.\\
+ORB-1 & Low & Initial elements are treated as osculating, so the SSO nodal rate is off by about 0.4\,\% (LTAN drifts a few minutes per year). & Acceptable for 48\,h runs.\\
+FRM-1 & Negligible & Frames are mean-of-date; UT1 = UTC and TT = UTC are assumed; nutation and polar motion are ignored. Direction errors are below 0.01$^\circ$. & Fine for power and magnetics, not for star-tracker accuracy studies.\\
+CFG-2 & Cosmetic & The \code{[mass\_budget]} keys trigger spurious ``unknown config key'' warnings. & Add \code{mass\_budget} to the list-section exclusions.\\
+\bottomrule
+\end{longtable}
+
+%=====================================================================
+\section{Frames, Conventions and Notation}
+%=====================================================================
+
+\paragraph{Frames.}
+\begin{itemize}
+\item \textbf{I (ECI):} geocentric, mean equator and equinox \emph{of date}. The orbit is propagated in this frame, the Sun ephemeris is expressed in it, and the Earth rotation angle (GMST) is measured from it.
+\item \textbf{E (ECEF):} Earth-fixed, obtained from I by a rotation about $\uv z$ through GMST $\theta_g$, with no polar motion.
+\item \textbf{B (body):} $+Z$ along the 3U long axis, toward the panel hinge end. The imager and S-band patch point along $-Z$. The Sun-pointing face is $+Z$.
+\end{itemize}
+
+\paragraph{Quaternions} \src{vecmath.hpp:84}. Quaternions are scalar-first, $q = (q_0, \vb q_v)$, with the Hamilton product
+\begin{equation}
+p\otimes q = \big(p_0 q_0 - \vb p_v\cdot\vb q_v,\; p_0\vb q_v + q_0\vb p_v + \vb p_v\times\vb q_v\big).
+\end{equation}
+The attitude quaternion maps \textbf{body to inertial}:
+\begin{equation}
+\vb v_I = q\otimes\vb v_B\otimes q^{*}
+\quad\Longleftrightarrow\quad
+\vb v_I = R(q)\,\vb v_B,
+\end{equation}
+and the rotation is computed with the efficient form
+\begin{equation}
+R(q)\vb v = \vb v + q_0\vb t + \vb q_v\times\vb t,\qquad \vb t = 2\,\vb q_v\times\vb v.
+\end{equation}
+The rotation vector (axis $\times$ angle) and its inverse take the shortest path:
+\begin{equation}
+\vb\phi = \frac{2\operatorname{atan2}(\lVert\vb q_v\rVert, q_0)}{\lVert\vb q_v\rVert}\,\vb q_v\quad(q_0\ge0),\qquad
+q(\vb\phi) = \Big(\cos\tfrac{\lVert\vb\phi\rVert}{2},\; \sin\tfrac{\lVert\vb\phi\rVert}{2}\,\uv\phi\Big).
+\end{equation}
+The angle between two attitudes is $\lVert\vb\phi(q_b\otimes q_a^{*})\rVert\in[0,\pi]$. A rotation matrix is converted to a quaternion with Shepperd's method, choosing the largest of the trace and the three diagonal terms \src{vecmath.hpp:128}.
+
+\paragraph{Units.} Orbit quantities are in km and km/s; attitude, torques and inertia are in SI units (N\,m, kg\,m$^2$, A\,m$^2$, T). Every conversion between the two systems is shown in the equation where it happens.
+
+%=====================================================================
+\section{Time, Earth Rotation, Sun and Geodesy}
+%=====================================================================
+
+\subsection{Julian date} \src{astro.hpp:28}
+Vallado Alg.~14, valid 1900--2100:
+\begin{equation}
+JD = 367Y - \left\lfloor \tfrac{7}{4}\Big(Y + \left\lfloor\tfrac{M+9}{12}\right\rfloor\Big)\right\rfloor + \left\lfloor\tfrac{275M}{9}\right\rfloor + D + 1721013.5 + \frac{1}{24}\Big(h + \frac{m + s/60}{60}\Big).
+\end{equation}
+
+\subsection{Greenwich mean sidereal time (IAU-82)} \src{astro.hpp:36}
+With $T_{UT1} = (JD - 2451545.0)/36525$ and UT1 taken equal to UTC ($|\Delta| < 0.9$\,s):
+\begin{equation}
+\theta_g\,[\mathrm{s}] = 67310.54841 + (876600\cdot3600 + 8640184.812866)\,T + 0.093104\,T^2 - 6.2\times10^{-6}\,T^3,
+\end{equation}
+which is reduced modulo 86400\,s and converted at $240\,\mathrm{s} = 1^\circ$.
+\begin{equation}
+\vb r_E = R_z(-\theta_g)\,\vb r_I, \qquad \vb r_I = R_z(\theta_g)\,\vb r_E .
+\end{equation}
+
+\subsection{Sun position} \src{astro.hpp:46}
+Vallado Alg.~29 (mean-of-date, about 0.01$^\circ$ accuracy):
+\begin{align}
+\lambda_M &= 280.460^\circ + 36000.771^\circ\,T, \qquad
+M_\odot = 357.5291092^\circ + 35999.05034^\circ\,T,\\
+\lambda_{\text{ecl}} &= \lambda_M + 1.914666471^\circ\sin M_\odot + 0.019994643^\circ\sin 2M_\odot,\\
+r_\odot &= \big(1.000140612 - 0.016708617\cos M_\odot - 0.000139589\cos 2M_\odot\big)\,\mathrm{AU},\\
+\varepsilon &= 23.439291^\circ - 0.0130042^\circ\,T,\\
+\vb r_\odot &= r_\odot\,\big(\cos\lambda_{\text{ecl}},\; \cos\varepsilon\sin\lambda_{\text{ecl}},\; \sin\varepsilon\sin\lambda_{\text{ecl}}\big).
+\end{align}
+The solar flux at the spacecraft is $S = 1361\,\mathrm{W\,m^{-2}}\,/\,(\lVert\vb r_\odot - \vb r\rVert/\mathrm{AU})^2$ \src{sim.cpp:476}.
+
+\subsection{Geodesy (WGS-84)} \src{astro.hpp:64--112}
+With $e^2 = f(2-f)$ and $N(\varphi) = R_\oplus/\sqrt{1 - e^2\sin^2\varphi}$:
+\begin{equation}
+\vb r_E = \big((N+h)\cos\varphi\cos\lambda,\; (N+h)\cos\varphi\sin\lambda,\; (N(1-e^2)+h)\sin\varphi\big).
+\end{equation}
+The inverse iterates $\varphi \leftarrow \operatorname{atan2}(z + N e^2\sin\varphi,\; p)$ six times, starting from $\operatorname{atan2}(z, p(1-e^2))$ with $p = \sqrt{x^2+y^2}$. Then $h = p/\cos\varphi - N$.
+
+The local ENU basis is
+$\uv e = (-\sin\lambda, \cos\lambda, 0)$,
+$\uv n = (-\sin\varphi\cos\lambda, -\sin\varphi\sin\lambda, \cos\varphi)$,
+$\uv u = (\cos\varphi\cos\lambda, \cos\varphi\sin\lambda, \sin\varphi)$.
+For the ground-station look angles, with $\vb\rho = \vb r_{\text{sat}} - \vb r_{\text{site}}$:
+\begin{equation}
+\text{el} = \arcsin\frac{\vb\rho\cdot\uv u}{\lVert\vb\rho\rVert},\qquad
+\text{az} = \operatorname{atan2}(\vb\rho\cdot\uv e,\; \vb\rho\cdot\uv n).
+\end{equation}
+
+%=====================================================================
+\section{Orbit}
+%=====================================================================
+
+\subsection{Initial state from elements} \src{orbit.hpp:22}
+\begin{gather}
+p = a(1-e^2),\qquad r = \frac{p}{1+e\cos\nu},\\
+\vb r_{PQW} = (r\cos\nu,\; r\sin\nu,\; 0),\qquad
+\vb v_{PQW} = \sqrt{\mu/p}\,(-\sin\nu,\; e+\cos\nu,\; 0),\\
+\vb r_I = R_z(\Omega)R_x(i)R_z(\omega)\,\vb r_{PQW},\qquad \vb v_I = R_z(\Omega)R_x(i)R_z(\omega)\,\vb v_{PQW}.
+\end{gather}
+The code sets $a = R_\oplus + h_0$ with $R_\oplus = 6378.1363$\,km and $\mu = 398600.4418$\,km$^3$s$^{-2}$, and $\nu = u_0 - \omega$, where $u_0$ is \code{arg\_latitude\_deg}.
+
+\subsection{Sun-synchronous inclination} \src{orbit.hpp:61}
+Equating the J2 nodal regression to the mean motion of the Sun, $\dot\Omega_\odot = 2\pi/(365.2421897\,\mathrm{d})$:
+\begin{equation}
+\dot\Omega = -\tfrac32\, n J_2 \left(\frac{R_\oplus}{p}\right)^{2}\cos i
+\quad\Rightarrow\quad
+\cos i = -\frac{\dot\Omega_\odot}{\tfrac32\, n J_2 (R_\oplus/p)^2},\qquad n = \sqrt{\mu/a^3}.
+\end{equation}
+At 500\,km this gives $i = 97.4018^\circ$. Because the elements are treated as osculating rather than mean (ORB-1), the realised nodal rate differs by about 0.4\,\%.
+
+\subsection{RAAN from local time of the ascending node} \src{orbit.hpp:71}
+The ascending node sits at local mean solar time LTAN, so its east longitude is $15^\circ(\text{LTAN} - \text{UT})$. Adding GMST gives the right ascension:
+\begin{equation}
+\Omega = \theta_g(JD) + 15^\circ\,(\text{LTAN} - \text{UT}_{\text{h}}),\qquad \text{UT}_{\text{h}} = 24\,\operatorname{frac}(JD - 0.5).
+\end{equation}
+
+\subsection{Zonal gravity J2--J6} \src{orbit.hpp:79}
+The potential, with $u = z/r = \sin\phi_{\text{gc}}$, is
+\begin{equation}
+U = \frac{\mu}{r}\Big[1 - \sum_{n=2}^{6} J_n\Big(\frac{R_\oplus}{r}\Big)^{n} P_n(u)\Big].
+\end{equation}
+Taking the gradient term by term (using $\nabla u = (\uv z - u\,\uv r)/r$) gives
+\begin{equation}
+\vb a = -\frac{\mu}{r^2}\uv r + \sum_{n=2}^{6}\frac{\mu J_n}{r^2}\Big(\frac{R_\oplus}{r}\Big)^{n}\Big[\big((n+1)P_n(u) + u P_n'(u)\big)\uv r - P_n'(u)\,\uv z\Big].
+\label{eq:zonal}
+\end{equation}
+The Legendre polynomials and their derivatives use the recursions
+\begin{equation}
+P_n = \frac{(2n-1)uP_{n-1} - (n-1)P_{n-2}}{n},\qquad P_n' = P_{n-2}' + (2n-1)P_{n-1}.
+\end{equation}
+The coefficients are EGM-96 unnormalised: $J_2 = 1.08262668\times10^{-3}$, $J_3 = -2.5327\times10^{-6}$, $J_4 = -1.6196\times10^{-6}$, $J_5 = -2.2730\times10^{-7}$, $J_6 = 5.4068\times10^{-7}$.
+\emph{Check:} for $n=2$, Eq.~\eqref{eq:zonal} reduces to the textbook $a_x = -\tfrac32 J_2\mu R_\oplus^2 x r^{-5}(1-5z^2/r^2)$.
+
+\subsection{Atmospheric drag}\label{sec:drag} \src{orbit.hpp:100--138}
+The density is a piecewise exponential (Vallado Table 8-4), scaled by the user factor $k_\rho$ (\code{density\_scale}):
+\begin{equation}
+\rho(h) = k_\rho\,\rho_0^{(j)}\exp\!\left(-\frac{h - h_0^{(j)}}{H^{(j)}}\right),\qquad h_0^{(j)}\le h < h_0^{(j+1)} .
+\end{equation}
+At 500\,km, $\rho_0 = 6.967\times10^{-13}$\,kg\,m$^{-3}$ and $H = 63.822$\,km. The drag acceleration is
+\begin{equation}
+\vb a_D = -\tfrac12\,\rho\,\frac{C_D A}{m}\,\lVert\vb v_r\rVert\,\vb v_r,\qquad \vb v_r = \vb v - \vb\omega_\oplus\times\vb r,
+\end{equation}
+with $C_D = 2.2$. The area $A$ is the \emph{mean} projected area from Cauchy's theorem, $A = \tfrac14\sum(\text{plate areas})$, with each thin panel counted on both sides; this gives $A = 0.1000$\,m$^2$. \textbf{Note (CFG-1):} $m$ is the mass-budget total (2.716\,kg), \emph{not} \code{orbit.mass\_kg}.
+
+\subsection{Integrator} \src{orbit.hpp:140}
+Classical RK4 on $\dot{\vb x} = (\vb v, \vb a(\vb r,\vb v))$ with a 1\,s sub-step (\code{orbit\_substep\_s}):
+\begin{equation}
+\vb x_{k+1} = \vb x_k + \tfrac{h}{6}(\vb k_1 + 2\vb k_2 + 2\vb k_3 + \vb k_4).
+\end{equation}
+
+%=====================================================================
+\section{Eclipse (Conical Shadow)}
+%=====================================================================
+\src{astro.hpp:124}, Montenbruck \& Gill \S3.4.2. With $\vb d = \vb r_\odot - \vb r$:
+\begin{equation}
+a = \arcsin\frac{R_\odot}{\lVert\vb d\rVert},\qquad
+b = \arcsin\frac{R_\oplus}{\lVert\vb r\rVert},\qquad
+c = \arccos\frac{-\vb r\cdot\vb d}{\lVert\vb r\rVert\lVert\vb d\rVert}.
+\end{equation}
+These are the apparent radii of the Sun and the Earth and the angle between their centres. The visible fraction $\nu$ of the solar disc is
+\begin{equation}
+\nu = \begin{cases}
+1 & c \ge a+b\\
+0 & c < b-a \quad\text{(umbra)}\\
+1 - b^2/a^2 & c < a-b \quad\text{(annular)}\\
+1 - A/(\pi a^2) & \text{otherwise (penumbra)}
+\end{cases}
+\end{equation}
+where
+\begin{equation}
+x = \frac{c^2+a^2-b^2}{2c},\quad y = \sqrt{a^2-x^2},\quad
+A = a^2\arccos\frac{x}{a} + b^2\arccos\frac{c-x}{b} - c\,y .
+\end{equation}
+The spacecraft is flagged as in eclipse when $\nu < 0.5$; power uses $\nu$ directly.
+\emph{Cross-check:} for $\beta = -24.1^\circ$ at 500\,km, the analytic cylindrical estimate $\tfrac{1}{\pi}\arccos\!\big(\sqrt{h^2+2R_\oplus h}/(r\cos\beta)\big)\,P = 34.6$\,min matches the simulated 34.6\,min.
+
+%=====================================================================
+\section{Geomagnetic Field (IGRF-14)}
+%=====================================================================
+\src{igrf.hpp}. Degree and order 13, epoch 2025.0 with secular variation, $a = 6371.2$\,km. The coefficients are propagated linearly in time:
+\begin{equation}
+g_n^m(t) = g_n^m(2025) + \dot g_n^m\,(t - 2025.0),\qquad h_n^m(t) = h_n^m(2025) + \dot h_n^m\,(t-2025.0).
+\end{equation}
+The scalar potential in geocentric spherical coordinates ($r$, colatitude $\vartheta$, longitude $\phi$) is
+\begin{equation}
+V = a\sum_{n=1}^{13}\Big(\frac{a}{r}\Big)^{n+1}\sum_{m=0}^{n}\big(g_n^m\cos m\phi + h_n^m\sin m\phi\big)P_n^m(\cos\vartheta),\qquad \vb B = -\nabla V,
+\end{equation}
+which gives
+\begin{align}
+B_r &= \sum_{n,m}(n+1)\Big(\frac{a}{r}\Big)^{n+2}\big(g\cos m\phi + h\sin m\phi\big)P_n^m,\\
+B_\vartheta &= -\sum_{n,m}\Big(\frac{a}{r}\Big)^{n+2}\big(g\cos m\phi + h\sin m\phi\big)\frac{dP_n^m}{d\vartheta},\\
+B_\phi &= -\frac{1}{\sin\vartheta}\sum_{n,m}\Big(\frac{a}{r}\Big)^{n+2} m\big(-g\sin m\phi + h\cos m\phi\big)P_n^m .
+\end{align}
+The Schmidt semi-normalised Legendre functions follow the recursions
+\begin{align}
+P_1^1 &= \sin\vartheta,\qquad P_n^n = \sqrt{\tfrac{2n-1}{2n}}\,\sin\vartheta\,P_{n-1}^{n-1}\quad(n\ge2),\\
+P_n^m &= \frac{(2n-1)\cos\vartheta\,P_{n-1}^m - \sqrt{(n-1)^2-m^2}\,P_{n-2}^m}{\sqrt{n^2-m^2}},
+\end{align}
+and their $\vartheta$-derivatives come from differentiating the same recursions. The field is converted to ECEF with $\uv e_r = (\sin\vartheta\cos\phi, \sin\vartheta\sin\phi, \cos\vartheta)$, $\uv e_\vartheta = (\cos\vartheta\cos\phi, \cos\vartheta\sin\phi, -\sin\vartheta)$ and $\uv e_\phi = (-\sin\phi, \cos\phi, 0)$, scaled from nT to T, and rotated into ECI with $R_z(\theta_g)$. The dipole moment direction is $\uv m_\oplus \propto (g_1^1, h_1^1, g_1^0)$, which points roughly toward geographic south as it should.
+
+%=====================================================================
+\section{Spacecraft Geometry and Mass Properties}
+%=====================================================================
+
+\subsection{Deployable panels} \src{geometry.hpp:97}
+For a panel on the side with outward normal $\uv s\in\{\pm\uv x, \pm\uv y\}$, deploy angle $\theta$ (0 = stowed, 90$^\circ$ = straight out) and hinge-end sign $\sigma = \pm1$:
+\begin{align}
+\uv n(\theta) &= \uv s\cos\theta + \sigma\uv z\sin\theta \quad\text{(front-cell normal)},\\
+\uv d(\theta) &= \uv s\sin\theta - \sigma\uv z\cos\theta \quad\text{(extension direction)},\\
+\vb c_{\text{panel}} &= \uv s\,(w/2 + 1.5\,\mathrm{mm}) + \sigma\uv z\,(\ell/2) + \tfrac{L_p}{2}\uv d .
+\end{align}
+Since $\uv n\cdot\uv d = 0$, the plate basis $(\uv d, \uv t = \uv n\times\uv d)$ has normal $\uv d\times\uv t = \uv n$. At $\theta = 135^\circ$ the front cells sit $45^\circ$ off $+Z$.
+
+\subsection{Self-shadowing} \src{geometry.hpp:118}
+Each cell face is sampled on a $12\times6$ grid of points $\vb p$. A ray $\vb p + t\,\uv s_B$ toward the Sun hits plate $(\vb c, \uv u, \uv v, \uv n, h_u, h_v)$ if
+\begin{equation}
+t = \frac{(\vb c - \vb p)\cdot\uv n}{\uv s_B\cdot\uv n} > 0,\qquad
+|(\vb p + t\uv s_B - \vb c)\cdot\uv u|\le h_u,\quad |(\cdot)\cdot\uv v|\le h_v .
+\end{equation}
+The lit fraction $f_{\text{lit}}$ is the share of samples that no other plate blocks.
+
+\subsection{Inertia} \src{adcs.hpp:99--145}
+Each mass-budget item is a uniform box of mass $m$ and size $(s_x, s_y, s_z)$:
+\begin{equation}
+I_{\text{box}} = \frac{m}{12}\operatorname{diag}(s_y^2+s_z^2,\; s_x^2+s_z^2,\; s_x^2+s_y^2).
+\end{equation}
+A ``shell'' item (the structure) is split into six thin faces, with mass proportional to face area. A deployable panel is a thin plate of length $L$ along $\uv u$ and width $W$ along $\uv v$:
+\begin{equation}
+I_{\text{plate}} = \frac{m_p}{12}\Big(W^2\,\uv u\uv u\tp + L^2\,\uv v\uv v\tp + (L^2+W^2)\,\uv n\uv n\tp\Big).
+\end{equation}
+Parts are combined about the common centre of mass with the parallel-axis theorem:
+\begin{equation}
+\vb c_m = \frac{\sum m_k\vb c_k}{\sum m_k},\qquad
+J = \sum_k\Big[I_k + m_k\big(\lVert\vb d_k\rVert^2\mathbb 1 - \vb d_k\vb d_k\tp\big)\Big],\quad \vb d_k = \vb c_k - \vb c_m .
+\end{equation}
+Results for the current configuration (2.716\,kg, CoM offset $(0.8, 0.3, 50.2)$\,mm):
+\begin{equation}
+J_{\text{dep}} \approx \operatorname{diag}(0.07227,\; 0.07230,\; 0.02098)\,\mathrm{kg\,m^2},\qquad
+J_{\text{stow}} \approx \operatorname{diag}(0.02979,\; 0.02983,\; 0.00561)\,\mathrm{kg\,m^2}.
+\end{equation}
+The products of inertia are $|J_{ij}| \le 3.3\times10^{-4}$\,kg\,m$^2$, so the principal axes are within about 0.4$^\circ$ of the body axes.
+
+%=====================================================================
+\section{Attitude Dynamics (Tumble and Detumble Phases)}
+%=====================================================================
+
+\subsection{Rigid-body equations} \src{adcs.hpp:189}
+Before the wheels are switched on, the body is a free rigid body. The equations of motion are
+\begin{align}
+J\dot{\vb\omega} &= \vb\tau - \vb\omega\times J\vb\omega, \label{eq:euler}\\
+\dot q &= \tfrac12\, q\otimes(0, \vb\omega), \label{eq:qdot}
+\end{align}
+with $\vb\omega$ in body axes. Both are integrated together by RK4 with a 0.1\,s step (\code{dyn\_substep\_s}). The torque is held constant over each step, and $q$ is renormalised after every step. The tests confirm that, with zero torque, angular momentum is conserved to $3\times10^{-12}$ and energy to $10^{-13}$ (relative).
+
+\subsection{Panel deployment} \src{sim.cpp:726}
+When the 30\,min inhibit timer expires, the inertia jumps from $J_{\text{stow}}$ to $J_{\text{dep}}$. Body-frame angular momentum is conserved across the jump:
+\begin{equation}
+\vb\omega^+ = J_{\text{dep}}^{-1}J_{\text{stow}}\,\vb\omega^- .
+\end{equation}
+In the launch run this takes $|\vb\omega|$ from $3.46^\circ$/s (the NRCSD tip-off of $2^\circ$/s per axis) down to $1.22^\circ$/s.
+
+\subsection{Disturbance torques} \src{adcs.hpp:212--232}, \src{sim.cpp:690}
+\paragraph{Gravity gradient.} With $\uv r_B$ the position unit vector in body axes:
+\begin{equation}
+\vb\tau_{gg} = \frac{3\mu}{r^3}\,\uv r_B\times J\uv r_B,\qquad
+\max\lVert\vb\tau_{gg}\rVert \approx \tfrac32\, n^2 (J_{xx}-J_{zz}) \approx 9\times10^{-8}\,\mathrm{N\,m}.
+\end{equation}
+\paragraph{Aerodynamic.} Each plate (windward body faces only; thin panels on either side) gets flat-plate drag:
+\begin{equation}
+\vb F_k = -\tfrac12\,\rho\,C_D\,A_k|\uv n_k\cdot\uv v|\,v^2\,\uv v,\qquad
+\vb\tau_{\text{aero}} = \sum_k (\vb c_k - \vb c_m)\times\vb F_k,
+\end{equation}
+with $\vb v = R\tp(\vb v - \vb\omega_\oplus\times\vb r)$ in m/s. Plates do not shadow each other from the flow. At 500\,km, $\tfrac12\rho v^2 \approx 2\times10^{-5}$\,Pa, which gives torques of order $10^{-7}$\,N\,m.
+\paragraph{Magnetic.} The residual dipole $\vb m_{\text{res}} = (5, 5, 10)$\,mA\,m$^2$ and the commanded torquer dipole both act through
+\begin{equation}
+\vb\tau_m = (\vb m_{\text{res}} + \vb m_{\text{cmd}})\times\vb B_B,\qquad \vb B_B = R\tp\vb B_I .
+\end{equation}
+With $|\vb B| \approx 30\,\mu$T, the residual alone gives about $4\times10^{-7}$\,N\,m.
+
+\subsection{B-dot detumbling}\label{sec:bdot} \src{sim.cpp:666--688, 1142--1163}
+\paragraph{Law as coded.} The EPS MCU samples $\vb B_B$ every $T_s = 1$\,s and applies
+\begin{equation}
+\vb m_{\text{cmd}} = \operatorname{sat}\!\Big(-\frac{k}{\lVert\vb B\rVert^2}\,\frac{\vb B_B(t_j) - \vb B_B(t_{j-1})}{T_s}\Big),
+\label{eq:bdot}
+\end{equation}
+which is held constant until the next sample.
+
+\paragraph{Gain} (Avanzini \& Giulietti 2012):
+\begin{equation}
+k = 2\,n\,(1 + \sin\xi_m)\,J_{\min},
+\end{equation}
+where $\xi_m$ is the angle between the orbit normal and the dipole axis $\uv m_\oplus$, i.e.\ the orbit's inclination to the geomagnetic equator. For this SSO, $\sin\xi_m \approx 0.97$, $n = 1.107\times10^{-3}$\,s$^{-1}$ and $J_{\min} = 0.02098$, so $k = 9.14\times10^{-5}$\,N\,m\,s. Units check: $[\mathrm{N\,m\,s}]\cdot[\mathrm{T/s}]/[\mathrm{T^2}] = \mathrm{N\,m/T} = \mathrm{A\,m^2}$.
+
+\paragraph{Saturation.} The commanded dipole is scaled uniformly, which keeps its direction, so that no axis exceeds its duty-limited capacity:
+\begin{equation}
+\operatorname{sat}(\vb m) = s\,\vb m,\qquad s = \min\Big(1,\; \min_i\frac{d_{\max}\,m_{i,\max}}{|m_i|}\Big),
+\end{equation}
+with $d_{\max} = 0.8$, $m_{x,\max} = 0.2$\,A\,m$^2$ (CR0002) and $m_{y,\max} = m_{z,\max} = 0.3$\,A\,m$^2$ (CR0003). The torquer power is
+\begin{equation}
+P_{\text{MTQ}} = \sum_i\frac{|m_i|}{m_{i,\max}}\,\frac{V^2}{R_i},\qquad V = 5\,\mathrm{V},\; R = 51, 45, 45\,\Omega .
+\end{equation}
+
+\paragraph{Why the law works (and ADCS-3).} In body axes, $\dot{\vb B}_B = -\vb\omega\times\vb B_B + R\tp\dot{\vb B}_I$. When the spacecraft is tumbling, the first term dominates, so
+\begin{equation}
+\vb m \approx \frac{k}{\lVert\vb B\rVert^2}\,\vb\omega\times\vb B
+\;\Rightarrow\;
+\vb\tau = \vb m\times\vb B = -k\big(\vb\omega - (\vb\omega\cdot\uv b)\uv b\big) = -k\,\vb\omega_\perp,
+\end{equation}
+\begin{equation}
+\frac{d}{dt}\Big(\tfrac12\vb\omega\tp J\vb\omega\Big) = \vb\omega\cdot\vb\tau = -k\lVert\vb\omega_\perp\rVert^2 \le 0 .
+\end{equation}
+The reference law is $\vb m_{AG} = -(k/\lVert\vb B\rVert)\,\dot{\uv b}$. Since $\dot{\uv b} = \big(\dot{\vb B} - \uv b(\uv b\cdot\dot{\vb B})\big)/\lVert\vb B\rVert$,
+\begin{equation}
+\vb m_{AG} = \vb m_{\text{code}} + \frac{k}{\lVert\vb B\rVert^2}(\uv b\cdot\dot{\vb B})\,\uv b,
+\end{equation}
+and the extra term is parallel to $\vb B$, so it produces \textbf{zero torque}. The two laws give identical torque whenever the torquers are not saturated. Under saturation, the coded law also spends some dipole capacity on the useless $\uv b$ component. The orbital term $R\tp\dot{\vb B}_I \sim 2n\lVert\vb B\rVert$ sets the residual-rate floor near twice the orbit rate.
+
+\paragraph{Exit condition.} Detumbling ends when $\lVert\vb\omega\rVert < 0.5^\circ$/s has held for 300\,s. The expected time constant is $J/k \approx 0.072/9.1\times10^{-5} \approx 790$\,s, so going from 1.22 to 0.5$^\circ$/s should take about $790\ln 2.44 \approx 12$\,min, plus the 5\,min hold. The simulation takes 18.8\,min, which is consistent once torquer saturation and $\langle\omega_\perp^2\rangle \approx \tfrac23\omega^2$ are allowed for.
+
+%=====================================================================
+\section{Mission-Mode Attitude (Wheels On)}\label{sec:mission}
+%=====================================================================
+
+\textbf{Read this section first.} In mission mode the simulator does \emph{not} integrate Eq.~\eqref{eq:euler}. It flies a reference attitude, as described below, and then computes the wheel momentum that \emph{would} be needed to fly it.
+
+\subsection{Guidance laws (target attitudes)} \src{models.hpp:189}, \src{sim.cpp:585}
+The ``align--constrain'' (TRIAD) construction puts body axis $\vb b_1$ exactly on target $\vb t_1$ and brings $\vb b_2$ as close as possible to $\vb t_2$:
+\begin{equation}
+\uv b_x = \frac{\vb b_1\times\vb b_2}{\lVert\cdot\rVert},\quad
+\uv t_x = \frac{\vb t_1\times\vb t_2}{\lVert\cdot\rVert},\qquad
+R_c = \big[\uv t_1\;\; \uv t_x\;\; \uv t_1\times\uv t_x\big]\,\big[\uv b_1\;\; \uv b_x\;\; \uv b_1\times\uv b_x\big]\tp .
+\end{equation}
+If $\vb b_2 \parallel \vb b_1$, the code substitutes $+X$ (or $+Y$ if $\vb b_1$ is near $\pm X$).
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Mode & $\vb b_1 \to \vb t_1$ & $\vb b_2 \to \vb t_2$ & Note\\
+\midrule
+Sun / Safe & $+Z\to\uv s_\odot$ & $+X\to$ nadir & \\
+Imaging, nadir idle & $-Z\to\cos\phi\,\uv n_{\text{nad}} + \sin\phi\,\uv h$ & $+Y\to\uv h\times\uv r$ (along-track) & roll $\phi = 0$ (imager must be nadir)\\
+Downlink & $-Z\to\vb r_{GS} - \vb r$ & $+X\to\uv s_\odot$ & fallback, see ADCS-6\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Rate- and acceleration-limited eigenaxis tracking}\label{sec:slew} \src{sim.cpp:1103--1123}
+The tracking runs in inertial axes with a sub-step $h = 0.25$\,s. Here $q$ is the flown attitude and $q_c(t)$ the reference propagated with the feed-forward rate:
+\begin{align}
+\vb\omega_{\text{ff}} &= \frac{1}{\Delta t}\,\vb\phi\big(q_c(t_{k+1})\otimes q_c(t_k)^{*}\big), \qquad q_c(t_k + jh) = q(\vb\omega_{\text{ff}}\,jh)\otimes q_c(t_k),\\
+\vb e &= \vb\phi\big(q_c\otimes q^{*}\big),\qquad \theta = \lVert\vb e\rVert, \\
+\vb\omega_{\text{des}} &= \vb\omega_{\text{ff}} + \uv e\,\min\!\big(\omega_{\max},\; \sqrt{2\alpha_{\max}\theta},\; \theta/h\big), \label{eq:brake}\\
+\Delta\vb\omega &= \vb\omega_{\text{des}} - \vb\omega,\qquad \vb\omega \leftarrow \vb\omega + \Delta\vb\omega\,\min\!\Big(1, \frac{\alpha_{\max}h}{\lVert\Delta\vb\omega\rVert}\Big),\\
+q &\leftarrow q(\vb\omega h)\otimes q \quad\text{(inertial-frame rate, left multiplication).}
+\end{align}
+The $\sqrt{2\alpha\theta}$ term is the braking curve: the largest rate from which the body can still stop at the target at deceleration $\alpha$. The automatic limits are
+\begin{equation}
+\omega_{\max} = 0.8\,\frac{h_{w,\text{rated}}}{J_{\max}} = 1.12^\circ/\mathrm{s},\qquad
+\alpha_{\max} = 0.8\,\frac{\tau_{w,\text{rated}}}{J_{\max}} = 0.146^\circ/\mathrm{s}^2,
+\end{equation}
+with $h_{w,\text{rated}} = 1.77$\,mNms and $\tau_{w,\text{rated}} = 0.23$\,mN\,m for CW0017. A task's slew starts $t_{\text{lead}}$ before its window opens, where
+\begin{equation}
+t_{\text{lead}} = \frac{\theta}{\omega_{\max}} + \frac{\omega_{\max}}{\alpha_{\max}} + t_{\text{settle}},
+\end{equation}
+which is the duration of a trapezoidal profile and an upper bound for a triangular one. For example, a 90$^\circ$ slew needs $80 + 8 + 20 \approx 108$\,s. The spacecraft counts as ``pointed'' when $\theta \le 2^\circ$.
+
+\subsection{Wheel momentum bookkeeping} \src{sim.cpp:1120--1131}
+Let $\vb H_I$ be the total (body + wheels) angular momentum in inertial axes, and $\vb h_w$ the wheel momentum in body axes. Then
+\begin{equation}
+\vb H_I = R\big(J\vb\omega_B + \vb h_w\big),\qquad
+\dot{\vb H}_I = R\,(\vb\tau_{gg} + \vb\tau_{\text{aero}} + \vb\tau_m),
+\end{equation}
+\begin{equation}
+\boxed{\;\vb h_w = R\tp\vb H_I - J\vb\omega_B\;},\qquad
+\vb\tau_w = \frac{\vb h_w(t_{k+1}) - \vb h_w(t_k)}{\Delta t}.
+\end{equation}
+Here $\vb\tau_w$ is the body-frame rate of change of wheel momentum, which equals the motor torque on the three body-aligned wheels. Because $\vb H_I$ is integrated exactly and $\vb h_w$ is taken as the residual, the gyroscopic term $\vb\omega\times(J\vb\omega + \vb h_w)$ is included implicitly. Wheel speed and power are
+\begin{equation}
+\Omega_i = \frac{h_{w,i}}{J_w},\quad J_w = \frac{h_{w,\text{rated}}}{6000\,\mathrm{rpm}} = 2.82\times10^{-6}\,\mathrm{kg\,m^2},\qquad
+P_{w,i} = P_{\text{avg}} + (P_{\text{peak}} - P_{\text{avg}})\min\!\Big(1, \frac{|\tau_{w,i}|}{\tau_{w,\text{rated}}}\Big).
+\end{equation}
+
+\subsection{Magnetic momentum dumping} \src{sim.cpp:1127}
+\begin{equation}
+\vb m_{\text{cmd}} = \operatorname{sat}\!\Big(\frac{k_d}{\lVert\vb B\rVert^2}\,\vb h_w\times\vb B_B\Big)
+\;\Rightarrow\;
+\vb\tau_m = \vb m\times\vb B = -k_d\big(\vb h_w - (\vb h_w\cdot\uv b)\uv b\big),
+\end{equation}
+with $k_d = 0.002$\,s$^{-1}$, a time constant of 500\,s for the momentum perpendicular to $\vb B$. The sign is correct: this external torque removes the stored wheel momentum. The momentum component along $\vb B$ cannot be dumped at that instant; it becomes dumpable as $\vb B$ rotates around the orbit.
+
+\subsection{What this model does not capture (ADCS-1, ADCS-2)}
+\begin{itemize}
+\item \textbf{No closed loop.} No attitude sensors (magnetometer, sun sensor, gyro, star tracker), noise, bias, estimator (TRIAD/QUEST/MEKF) or control law (PD/LQR). The pointing error $\theta$ comes only from the reference profile, so steady-state pointing is effectively perfect by construction.
+\item \textbf{No actuator limits in the loop.} $\alpha_{\max}$ limits the commanded acceleration, but $\vb\tau_w$ is never compared with $\tau_{w,\text{rated}}$ per axis, and $|h_{w,i}| > h_{w,\text{rated}}$ only raises a \code{WHEEL} event. Since $\lVert\vb\omega\times\vb h_w\rVert \lesssim 0.02\cdot1.8\times10^{-3} \approx 4\times10^{-5}$\,N\,m, the analytic bound is $|\tau_{w,i}| \lesssim 0.8\,\tau_{\text{rated}} + 4\times10^{-5} \approx 0.22$\,mN\,m, just under the rating. A compiler was not available to confirm this numerically.
+\item \textbf{Thin momentum margin.} Peak $|h_{w,i}| = 1.605$\,mNms, or 91\,\% of the rating (5440\,rpm, 54\,\% of the 10\,000\,rpm maximum). The automatic $\omega_{\max}$ reserves only 20\,\% of the rating for stored momentum and disturbance build-up. Disturbance build-up alone is about $10^{-7}\,\mathrm{N\,m}\times5700\,\mathrm{s} \approx 0.6$\,mNms per orbit if not dumped. A safer limit is
+\begin{equation}
+\omega_{\max} = \frac{h_{w,\text{rated}} - \max_i|h_{w,i}| - h_{\text{reserve}}}{J_{\max}}.
+\label{eq:wmax-fix}
+\end{equation}
+\item \textbf{Feed-forward spikes (ADCS-5).} $\vb\omega_{\text{ff}}$ is not clamped. If the target pair $(\vb t_1, \vb t_2)$ becomes parallel and the guidance law switches its secondary axis, $\vb\omega_{\text{ff}}$ can reach $\Delta\theta/\Delta t$. The acceleration limit still bounds the response.
+\end{itemize}
+
+%=====================================================================
+\section{Environment Light, Solar Array, Thermal and Battery}
+%=====================================================================
+
+\subsection{Earth albedo and infrared} \src{earth\_radiation.hpp}
+The visible cap (half-angle $\lambda_{\max} = \arccos(R_\oplus/r)$) is split into $32\times64$ cells. Each cell has centre direction $\uv c$, area $dA = R_\oplus^2\sin\lambda\,d\lambda\,d\phi$, and offset $\vb d = R_\oplus\uv c - \vb r$ from the spacecraft. Each cell is treated as a Lambertian emitter:
+\begin{gather}
+L_{\text{alb}} = \frac{a\,S\max(0, \uv c\cdot\uv s_\odot)}{\pi},\qquad L_{\text{IR}} = \frac{\text{OLR}}{\pi},\\
+E_f = \sum_{\text{cells}} L\,\max(0, \uv n_f\cdot\uv d)\,\frac{\max(0, -\uv c\cdot\uv d)\,dA}{\lVert\vb d\rVert^2},
+\end{gather}
+with $a = 0.30$ and OLR $= 237$\,W\,m$^{-2}$. This is validated against the analytic view factor $E_{\text{IR,nadir}} = \text{OLR}\sin^2\rho$.
+
+\subsection{Cell power} \src{models.hpp:26}, \src{sim.cpp:852}
+\begin{gather}
+\eta(T) = \eta_{\text{ref}}\big[1 + \beta(T - T_{\text{ref}})\big]\,\eta_{\text{derate}}\,\eta_{\text{deg}},\\
+\text{IAM}(\cos\theta) = \frac{1 - e^{-\cos\theta/a_r}}{1 - e^{-1/a_r}} \quad\text{(Martin--Ruiz, } a_r = 0.16),\\
+P_f = A_{c,f}\,\eta(T)\Big[\nu S\max(0,\cos\theta_f)\,f_{\text{lit},f}\,\text{IAM}(\cos\theta_f) + E_{\text{alb},f}\,\text{IAM}_d\Big],\qquad P_{\text{array}} = \eta_{\text{MPPT}}\sum_f P_f .
+\end{gather}
+\emph{Check:} with the Sun on $+Z$, four $135^\circ$ panels each with $7\times30.18$\,cm$^2$ front cells give $0.0845\cdot\cos45^\circ\cdot1361\cdot0.295\cdot0.95\cdot0.990\cdot0.93 = 21.0$\,W. The simulator reports 20.98\,W.
+
+\subsection{Panel thermal (one node per panel)} \src{models.hpp:78}
+\begin{equation}
+m c_p\frac{dT}{dt} = A\big[\alpha_f q_{s,f} + \varepsilon_f q_{IR,f} + \alpha_b q_{s,b} + \varepsilon_b q_{IR,b}\big] - P_{\text{el}} - A(\varepsilon_f + \varepsilon_b)\sigma T^4,
+\end{equation}
+integrated with explicit Euler in steps of at most 2\,s. The thermal time constant is $m c_p/(4\sigma T^3 A\sum\varepsilon) \approx 400$\,s, so the scheme is stable.
+
+\subsection{Battery} \src{models.hpp:57}
+With net bus power $P = P_{\text{array}} - P_{\text{load}}$:
+\begin{equation}
+\Delta E = \begin{cases}
+\min\!\big(\eta_c\min(P, P_{c,\max})\Delta t,\; E_{\max} - E\big) & P \ge 0\\
+-\min\!\big(\min(-P, P_{d,\max})\Delta t/\eta_d,\; E\big) & P < 0
+\end{cases}
+\end{equation}
+Power the battery cannot accept is booked as curtailed; load it cannot supply is booked as unmet.
+
+%=====================================================================
+\section{Payload Data and S-band Link}
+%=====================================================================
+
+\subsection{Imaging geometry and data rate} \src{sim.cpp:485--515, 958--967}
+The cross-track look angle to a ground point at central angle $\lambda$ is $\eta = \operatorname{atan2}(\sin\lambda,\; r/R_\oplus - \cos\lambda)$. The half field of view is $\arctan(\text{swath}/2h_{\text{ref}}) = 6.84^\circ$. The data rate is
+\begin{gather}
+v_g = \big\lVert\vb v_r - (\vb v_r\cdot\uv r)\uv r\big\rVert\,\frac{R_\oplus}{r},\qquad
+\text{GSD} = \text{GSD}_{\text{ref}}\frac{h}{h_{\text{ref}}}\,b,\\
+\dot D = \frac{N_{px}}{b}\,N_{\text{bands}}\,N_{\text{bits}}\,\frac{v_g}{\text{GSD}}\cdot\frac{1}{CR}\;\approx\;\frac{4096\cdot32\cdot12\cdot235}{4} \approx 92\,\mathrm{Mbit/s}.
+\end{gather}
+
+\subsection{Link budget} \src{models.hpp:100}
+\begin{gather}
+G(\theta) = G_0 - \min\!\big(12(\theta/\theta_{3\text{dB}})^2,\; 25\big)\ \mathrm{dB},\qquad
+\text{FSPL} = 20\log_{10}\frac{4\pi d f}{c},\\
+C/N_0 = 10\log_{10}P_{tx} + G(\theta) - L_{tx} - \text{FSPL} - L_{\text{path}} + G/T - (-228.6),\\
+M = C/N_0 - 10\log_{10}R_b - (E_b/N_0)_{\text{req}} - L_{\text{impl}} \ge M_{\text{req}},\qquad
+R_b \le R_s\log_2(4)\,r_c\,\eta_{\text{frame}} .
+\end{gather}
+The highest rate on the configured rate ladder that meets both conditions is selected. The PA draws $P_{tx}/\text{PAE}$ from the bus.
+
+%=====================================================================
+\section{Verification Performed}\label{sec:verif}
+%=====================================================================
+
+\subsection{Hand checks of the equations}
+Each item below was re-derived by hand and compared with the code:
+\begin{itemize}
+\item Hamilton product, the vector-rotation identity, Shepperd's matrix-to-quaternion method, and the body$\to$inertial convention used consistently in Eq.~\eqref{eq:qdot}, the mission-mode left-multiplied update, the gravity-gradient frame and the B-dot frame.
+\item PQW$\to$ECI rotation matrix, the J$_n$ gradient (Eq.~\eqref{eq:zonal}) and the Legendre recursions, drag units (km/s versus m/s), the SSO condition and the LTAN$\to$RAAN relation.
+\item The IGRF Schmidt recursions, the $(a/r)^{n+2}$ exponent, the signs of $B_\vartheta$ and $B_\phi$, the spherical-to-ECEF basis, and the dipole direction.
+\item The conical shadow overlap area, the albedo solid-angle weight and its m$^2$/km$^2$ conversions.
+\item The inertia tensors, the parallel-axis term, the panel normal/extension orthogonality, and conservation of momentum at deployment.
+\item The B-dot torque and Lyapunov derivative, the equivalence to Avanzini \& Giulietti, the dumping sign, and the wheel-momentum identity.
+\item Numerical spot checks against simulator output: eclipse duration, peak array power, slew limits, B-dot gain and detumble time (all shown above).
+\end{itemize}
+
+\subsection{Automated tests (\texttt{./build/cubesat\_tests}: 55 passed, 0 failed)}
+\begin{center}
+\begin{tabular}{@{}L{4.2cm}L{11.5cm}@{}}
+\toprule
+Group & Checks\\
+\midrule
+Time and ephemeris & GMST against Vallado Ex.~3-5; Sun vector against Ex.~5-1; JD of J2000\\
+Geodesy & geodetic round trip; polar radius equals $b$\\
+Orbit mechanics & element round trip; SSO $i$ at 500\,km; two-body energy drift over 1 day; J2 nodal rate; J2 equatorial acceleration; density at 500\,km\\
+Eclipse & full Sun, umbra, monotonic penumbra, 50\,\% at the shadow edge\\
+Earth radiation & numerical cap against the analytic view factor for nadir, zenith and horizontal plates\\
+Geometry & panel normals; lit and shadowed fractions\\
+Attitude and link & align-constrain error; quaternion angle; FSPL; C/N$_0$\\
+IGRF-14 & SAA minimum $\approx 22\,\mu$T and its location; maximum $\approx 66\,\mu$T; $B_z = 2g_1^0$ at the pole; $|B|$ at Pilani and at 500\,km\\
+Dynamics and mass & mass total; $I_{zz} < I_{xx}$; symmetry; $JJ^{-1} = \mathbb 1$; torque-free conservation of $\vb H$ and energy; wheel and torquer specs\\
+Payload & swath roll; readout bookkeeping\\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{Gap:} no test exercises B-dot convergence, momentum dumping, the slew profile, or wheel momentum and torque limits. These are the parts the ADCS lead cares about most.
+
+%=====================================================================
+\section{Recommended Next Step for ADCS Fidelity}\label{sec:recommend}
+%=====================================================================
+Replace the kinematic mission mode with the coupled body-plus-wheel plant
+\begin{equation}
+J\dot{\vb\omega} = \vb\tau_{\text{ext}} - \vb\tau_w - \vb\omega\times(J\vb\omega + \vb h_w),\qquad \dot{\vb h}_w = \vb\tau_w,
+\label{eq:plant}
+\end{equation}
+together with a saturated quaternion-feedback law
+\begin{equation}
+\vb\tau_c = -K_p\,\operatorname{sgn}(\delta q_0)\,\delta\vb q_v - K_d\,(\vb\omega - \vb\omega_c) + \vb\omega\times(J\vb\omega + \vb h_w),\qquad
+\vb\tau_w = -\operatorname{clip}(\vb\tau_c,\; \pm\tau_{w,\text{rated}}),
+\end{equation}
+where $\delta q = q_c^{*}\otimes q$. Close the loop on \emph{estimated} rather than true states, using sensor models for the magnetometer, sun sensor and gyro (noise, bias, field of view, eclipse). Then add tests for detumble time, steady-state pointing error, and wheel-saturation recovery.
+
+%=====================================================================
+\appendix
+\section{Key Parameters (from \texttt{config/sim.cfg})}
+%=====================================================================
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Symbol & Value & Config key\\
+\midrule
+$h_0$, $e$, LTAN & 500\,km, 0, 10:30 & \code{orbit.*}\\
+$C_D$, $k_\rho$ & 2.2, 1.0 & \code{orbit.drag\_cd}, \code{density\_scale}\\
+$m$ (used) & 2.716\,kg (mass budget) & \code{[mass\_budget]}\\
+$\theta_{\text{panel}}$ & $135^\circ\times4$, hinge $+Z$ & \code{geometry.panel\_angles\_deg}\\
+Wheels & CW0017, 1.77\,mNms, 0.23\,mN\,m & \code{adcs.wheel\_model}\\
+Torquers & 0.2/0.3/0.3\,A\,m$^2$, $d_{\max} = 0.8$ & \code{adcs.torquer\_*}, \code{mtq\_max\_duty}\\
+$\vb m_{\text{res}}$ & (5, 5, 10)\,mA\,m$^2$ & \code{adcs.residual\_dipole\_am2}\\
+$k_d$ & 0.002\,s$^{-1}$ & \code{adcs.dump\_gain}\\
+$\vb\omega_0$ (tip-off) & $(2, -2, 2)^\circ$/s & \code{flightplan.initial\_omega\_deg\_s}\\
+B-dot $T_s$, exit & 1\,s; $<0.5^\circ$/s for 300\,s & \code{flightplan.bdot\_period\_s}, \dots\\
+$t_{\text{settle}}$, tolerance & 20\,s, 2$^\circ$ & \code{attitude.*}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{References}
+\begin{enumerate}
+\item D.~A.~Vallado, \emph{Fundamentals of Astrodynamics and Applications}, 4th ed., Microcosm Press, 2013.
+\item O.~Montenbruck and E.~Gill, \emph{Satellite Orbits}, Springer, 2000, \S3.4.2.
+\item P.~Alken \emph{et al.}, International Geomagnetic Reference Field: the fourteenth generation (IGRF-14), IAGA WG V-MOD, 2024.
+\item G.~Avanzini and F.~Giulietti, ``Magnetic detumbling of a rigid spacecraft'', \emph{J. Guidance, Control, and Dynamics} 35(4), 2012.
+\item F.~L.~Markley and J.~L.~Crassidis, \emph{Fundamentals of Spacecraft Attitude Determination and Control}, Springer, 2014.
+\item N.~Martin and J.~M.~Ruiz, ``Calculation of the PV modules angular losses under field conditions'', \emph{Prog. Photovoltaics} 9, 2001.
+\end{enumerate}
+
+\end{document}

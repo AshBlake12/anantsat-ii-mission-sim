@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CubeSat Mission Simulator</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛰️</text></svg>">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<script src="sim_data.js"></script>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/" } }
+</script>
+</head>
+<body>
+<header id="head">
+  <h1>CubeSat Mission Simulator</h1>
+  <nav id="tabs" role="tablist">
+    <button role="tab" data-tab="setup">Setup</button>
+    <button role="tab" data-tab="orbit">3D Orbit</button>
+    <button role="tab" data-tab="ground">Groundtrack</button>
+    <button role="tab" data-tab="attitude">Attitude</button>
+    <button role="tab" data-tab="plots">Plots</button>
+    <button role="tab" data-tab="telemetry">Telemetry</button>
+    <button role="tab" data-tab="report">Windows &amp; Report</button>
+    <button id="popout" title="Open the current tab in its own window (stays in sync)">Open in new window &#x29C9;</button>
+  </nav>
+</header>
+
+<div id="player">
+  <button id="animate" class="play">&#9654; Play</button>
+  <span id="clock">--</span>
+  <input type="range" id="slider" min="0" max="10000" value="0" aria-label="Simulation time">
+  <label>speed
+    <select id="speed">
+      <option value="1">1&times;</option><option value="10">10&times;</option><option value="30">30&times;</option>
+      <option value="60" selected>60&times;</option><option value="120">120&times;</option><option value="300">300&times;</option>
+      <option value="600">600&times;</option><option value="1800">1800&times;</option>
+    </select>
+  </label>
+  <span class="jumps">
+    <button data-jump="pass">pass &#x23ED;</button>
+    <button data-jump="imaging">imaging &#x23ED;</button>
+    <button data-jump="eclipse">eclipse &#x23ED;</button>
+    <button data-jump="phase">phase &#x23ED;</button>
+  </span>
+  <span id="modebadge"></span>
+</div>
+
+<main>
+  <!-- SETUP -------------------------------------------------------------->
+  <section id="tab-setup" class="tab">
+    <div class="subtitle">3U hyperspectral CubeSat &middot; C++ engine: J2&ndash;J6 + drag &middot; IGRF-14 &middot; B-dot detumbling &middot; ray-cast panel shadowing &middot; albedo &middot; wheels &middot; S-band link</div>
+    <div class="btnrow">
+      <span class="seg" role="group" aria-label="Flight plan">
+        <button data-flight="launch">Detumbling (LEOP) mode</button><button data-flight="mission">Mission mode</button>
+      </span>
+      <button id="run">Run Simulation!</button>
+      <button id="reset">Reset</button>
+      <button id="advbtn">Advanced config</button>
+      <button id="download">Save config</button>
+      <span id="status"></span>
+    </div>
+    <div id="inputs"></div>
+    <textarea id="adv" hidden spellcheck="false" aria-label="Full simulator configuration"></textarea>
+    <div id="summary"></div>
+  </section>
+
+  <!-- 3D ORBIT ----------------------------------------------------------->
+  <section id="tab-orbit" class="tab view">
+    <div id="orbitview" class="stage"></div>
+    <div class="overlay tl" id="orbithud"></div>
+    <div class="overlay tr">
+      <label><input type="checkbox" id="tg-full" checked> full orbit</label>
+      <label><input type="checkbox" id="tg-sun" checked> Sun vector</label>
+      <label><input type="checkbox" id="tg-eq"> equatorial plane</label>
+      <label><input type="checkbox" id="tg-follow"> follow CubeSat</label>
+    </div>
+  </section>
+
+  <!-- GROUNDTRACK -------------------------------------------------------->
+  <section id="tab-ground" class="tab view">
+    <div class="stage"><div id="gt"></div><canvas id="gtover"></canvas></div>
+    <div class="overlay tr">
+      <label><input type="checkbox" id="tg-gscone" checked> GS visibility</label>
+      <label><input type="checkbox" id="tg-term" checked> day/night line</label>
+      <label><input type="checkbox" id="tg-foot" checked> footprint</label>
+    </div>
+  </section>
+
+  <!-- ATTITUDE ----------------------------------------------------------->
+  <section id="tab-attitude" class="tab view">
+    <div id="att" class="stage"></div>
+    <div class="overlay tl" id="hud"></div>
+    <div class="overlay tr">
+      <button id="frame-btn">Frame: LVLH</button>
+      <button id="cam-btn">Reset camera</button>
+    </div>
+  </section>
+
+  <!-- PLOTS -------------------------------------------------------------->
+  <section id="tab-plots" class="tab">
+    <div id="plotpick"></div>
+    <div id="plotgrid"></div>
+  </section>
+
+  <!-- TELEMETRY ---------------------------------------------------------->
+  <section id="tab-telemetry" class="tab">
+    <div id="telemetry"></div>
+  </section>
+
+  <!-- REPORT ------------------------------------------------------------->
+  <section id="tab-report" class="tab">
+    <div class="cols">
+      <div class="card"><div class="cardtitle">Planned windows (click to jump)</div><div id="tasks"></div></div>
+      <div class="card"><div class="cardtitle">Events</div><div id="events"></div></div>
+    </div>
+    <div class="card"><div class="cardtitle">C++ engine report</div><pre id="console"></pre></div>
+  </section>
+</main>
+
+<div id="legend"></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

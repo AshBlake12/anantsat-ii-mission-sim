@@ -1,0 +1,6 @@
+build/
+output/
+viewer/sim_data.js
+docs/*.zip
+*.o
+.DS_Store
